@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowchart-practice"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy==2.5.0",
+    "scipy==1.18.0",
+    "scikit-learn==1.9.0",
+    "joblib==1.5.3",
+    "narwhals==2.23.0",
+    "threadpoolctl==3.6.0",
+]
