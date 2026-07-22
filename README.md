@@ -14,7 +14,7 @@ nftables的L3/L4防禦經討論後刪除，未來若開發提早完成或L3/L4�
 | 流程層 | 模組 / 元件 | 說明 |
 |---|---|---|
 | 訓練資料層（離線） | CICIDS2017、CSE-CIC-IDS2018（正常流量部分） | 擷取正常流量作為初始正樣本，解決正常/惡意樣本不平衡問題 |
-~~| 第一層　邊緣防禦 | nftables（L3/L4 靜態規則） | 依 IP、Port、TCP Flags 封鎖 SYN Flood、Port Scan 等 L3/L4 攻擊 |~~
+| ~~第一層　邊緣防禦~~ | ~~nftables（L3/L4 靜態規則）~~ | ~~依 IP、Port、TCP Flags 封鎖 SYN Flood、Port Scan 等 L3/L4 攻擊~~ |
 | 第二層　統計防禦 | Redis + LightGBM | 統計同 IP 請求頻率、URL 變異度等 window-based 特徵，識別 HTTP 洪水（CC Attack） |
 | 第三層　語意防禦 | TextCNN（PyTorch） | 對通過前兩層的 HTTP Payload 做字元/詞嵌入，辨識 SQLi、XSS、RCE 等應用層攻擊 |
 | 分流引流模組 | Reverse Proxy（Flow Router） | 依模型判定分流：正常流量 → 真實伺服器 + 鏡像蜜罐；惡意流量 → 蜜罐 |
@@ -37,7 +37,7 @@ nftables的L3/L4防禦經討論後刪除，未來若開發提早完成或L3/L4�
 | 模組 | 語言 | 關鍵技術 / 套件 |
 |---|---|---|
 | 訓練資料整合（CICIDS2017 / CSE-CIC-IDS2018） | Python | pandas, scikit-learn, imbalanced-learn |
-~~| L3/L4 邊緣防禦 | C / Python | nftables, python-nftables |~~
+| ~~L3/L4 邊緣防禦~~ | ~~C / Python~~ | ~~nftables, python-nftables~~ |
 | L7 統計防禦（HTTP 洪水） | Python | LightGBM, Redis, scikit-learn, pandas |
 | L7 語意防禦（應用層攻擊） | Python | TextCNN, PyTorch, NumPy |
 | 流量分流代理 | Go / Python | Scapy, Nginx (Lua), FastAPI |
