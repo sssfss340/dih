@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowchart-practice"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.0",
+    "scikit-learn>=1.9.0",
+    "datasets>=5.0.0",
+    # torch/torchvision/torchaudio 這裡的 venv 是裝 cu128 (CUDA) build，
+    # 用 `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128` 安裝
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "torchaudio>=2.11.0",
+]
