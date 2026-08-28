@@ -1,0 +1,7 @@
+1.前往 https://intrusion-detection.distrinet-research.be/CNS2022/Datasets/
+2.點擊下載 CSECICIDS2018_improved.zip
+3.下載 dataset.py
+4.CSECICIDS2018_improved.zip 解壓縮到 dataset.py 所在資料夾
+5.執行 dataset.py
+
+不要把資料集丟到 github 上，會塞爆專案大小上限
