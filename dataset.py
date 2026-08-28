@@ -42,6 +42,6 @@ if __name__ == "__main__":
     if modify!="y":
         sys.exit()
 
-    with Pool(processes=min(len(datasets), 5)) as pool:
+    with Pool(processes=min(len(datasets), cpu_count())) as pool:
         for result in pool.imap_unordered(process_file, datasets):
             print(result)
