@@ -1,0 +1,1 @@
+#要如何處理csv的資料傳到 redis / lightGBM
