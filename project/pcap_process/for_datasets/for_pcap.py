@@ -177,18 +177,19 @@ class Flow:
     """單一方向的 TCP byte-stream 重組緩衝區。"""
 
     __slots__ = ("marker", "base", "next_rel", "buffered", "pending",
-                 "last_time", "fin_rel", "closed", "saw_data")
+                 "start_time", "last_time", "fin_rel", "closed", "saw_data")
 
     def __init__(self, marker):
-        self.marker    = marker
-        self.base      = None    # 相對位移的基準 seq
-        self.next_rel  = 0       # 下一個尚未吐出的連續位移
-        self.buffered  = {}      # rel_offset -> Payload（亂序、還接不上的片段）
-        self.pending   = 0       # 距離上次排進 output 後新增的有效 segment 數
-        self.last_time = None    # 最後一個 segment 的封包時間戳
-        self.fin_rel   = None    # FIN 對應的相對位移（= stream 結尾）
-        self.closed    = False   # 連線已收尾，不會再有新 segment
-        self.saw_data  = False   # 這條 flow 是否曾帶過 payload
+        self.marker     = marker
+        self.base       = None    # 相對位移的基準 seq
+        self.next_rel   = 0       # 下一個尚未吐出的連續位移
+        self.buffered   = {}      # rel_offset -> Payload（亂序、還接不上的片段）
+        self.pending    = 0       # 距離上次排進 output 後新增的有效 segment 數
+        self.start_time = None    # 第一個 segment 的封包時間戳（給離線標記比對用）
+        self.last_time  = None    # 最後一個 segment 的封包時間戳
+        self.fin_rel    = None    # FIN 對應的相對位移（= stream 結尾）
+        self.closed     = False   # 連線已收尾，不會再有新 segment
+        self.saw_data   = False   # 這條 flow 是否曾帶過 payload
 
     def _rel(self, seq):
         rel = seq - self.base
@@ -197,6 +198,8 @@ class Flow:
         return rel
 
     def add_segment(self, seq, payload, syn, fin, ts):
+        if self.start_time is None:
+            self.start_time = ts
         self.last_time = ts
         if self.base is None:
             # SYN 佔一個序號，資料從 seq+1 開始；沒 SYN 就把第一個 seq 當 byte 0

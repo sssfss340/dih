@@ -5,30 +5,44 @@
   * for_pcap  ── 讀 pcap 檔，用「封包時間戳」判斷 flow 閒置，不開執行緒。
   * online    ── 用 scapy 直接嗅探網卡，用 threading.Timer 以「真實時鐘」
                  定期把閒置 / 已收齊的 flow 收尾，並把重組好的資料交給
-                 下游 handler（預設印出；實務上換成寫 redis / 丟 lightGBM /
-                 textCNN）。
+                 下游 handler。
 
 TCP stream 重組本身（Payload / Flow / FlowPackager / FlowOutput）直接沿用
 for_pcap，不重寫。
 
+CNN 跟 LightGBM 未來會跑在不同電腦上，所以不直接呼叫模型，而是把同一批封包
+分別餵給兩條各自獨立的追蹤器，各自轉成自己要的輸入格式後用 HTTP JSON POST
+送到各自的推論服務：
+  * CNN      ── LiveFlowPackager 重組 byte stream，可以吃片段，逐步累積著送
+    （見 _FlowByteBuffer）。
+  * LightGBM ── flow_stats.FlowStatsTracker 累積 CICFlowMeter 那組統計特徵
+    （跟 for_pcap.py 的 Flow 平行、互不干擾），整條 flow 收齊才送一次。
+
 用法（需系統管理員 / root，Windows 需裝 Npcap）：
-    python -m pcap_process.online -i Wi-Fi
-    python -m pcap_process.online -i eth0 --bpf "tcp port 80" --interval 1 --idle 20
+    python -m pcap_process.online -i Wi-Fi --cnn-url http://cnn-host:8800/predict
+    python -m pcap_process.online -i eth0 --bpf "tcp port 80" \\
+        --cnn-url http://cnn-host:8800/predict --lgbm-url http://lgbm-host:8801/predict
 """
 
 import argparse
+import base64
+import json
 import time
+import urllib.error
+import urllib.request
 from threading import Timer, RLock
 
 from scapy.all import AsyncSniffer
 
 try:  # 以套件方式執行： python -m pcap_process.online
     from .for_datasets.for_pcap import ProtocolParser, FlowPackager
+    from .for_datasets.flow_stats import FlowStatsTracker
 except ImportError:  # 直接執行： python pcap_process/online.py
     import os
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from pcap_process.for_datasets.for_pcap import ProtocolParser, FlowPackager
+    from pcap_process.for_datasets.flow_stats import FlowStatsTracker
 
 
 class RepeatingTimer(Timer):
@@ -109,43 +123,120 @@ class LiveFlowPackager(FlowPackager):
             self._retire(marker)
 
 
-def handle_flow(marker, data, protocol, offset, closed):
-    """下游接口。把這裡換成真正的處理即可，簽章不變。
+CNN_MAX_BYTES = 1500  # 跟 model.textCNN.tokenizer.ByteTokenizer 的預設 max_len 對齊
 
-    例：丟進 redis stream 讓推論服務去消費 ──
-        import redis, json
-        r = redis.Redis()
-        r.xadd("flows", {
-            "src": marker[0], "sport": marker[1],
-            "dst": marker[2], "dport": marker[3],
-            "offset": offset, "closed": int(closed),
-            "protocol": json.dumps(protocol),
-            "data": data,                       # bytes，redis 可直接存
+
+class _FlowByteBuffer:
+    """CNN 用：把 LiveFlowPackager 逐次吐出的「新增片段」累積成「目前為止的
+    完整 payload」（截到 CNN_MAX_BYTES）。這樣 CNN 推論服務本身不用記任何
+    flow 狀態，每通 HTTP request 都是獨立、無狀態的——之後要疊多台 CNN 推論
+    服務分流也不用處理 sticky routing。"""
+
+    def __init__(self, max_len: int = CNN_MAX_BYTES):
+        self.max_len = max_len
+        self._buffers: dict[tuple, bytearray] = {}
+
+    def update(self, marker, data: bytes, offset: int) -> bytes:
+        buf = self._buffers.setdefault(marker, bytearray())
+        if offset > len(buf):
+            return bytes(buf)          # 理論上不會發生（take_contiguous 保證連續），防禦性跳過
+        if offset < len(buf):
+            data = data[len(buf) - offset:]
+        if len(buf) < self.max_len:
+            buf.extend(data[: self.max_len - len(buf)])
+        return bytes(buf)
+
+    def discard(self, marker):
+        self._buffers.pop(marker, None)
+
+
+def send_json(url: str, payload: dict, timeout: float = 2.0):
+    """把 payload 編碼成 JSON POST 給遠端推論服務。失敗只印警告、回傳 None，
+    不能讓下游模型服務斷線/逾時拖垮封包擷取本身。"""
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        print(f"[online] POST {url} 失敗: {exc!r}")
+        return None
+
+
+def make_cnn_handler(cnn_url: str):
+    """回傳 LiveFlowPackager 用的 on_flow callback：累積片段、送 base64
+    payload 給 CNN 推論服務。"""
+    cnn_buffers = _FlowByteBuffer()
+
+    def handle(marker, data, protocol, offset, closed):
+        buf = cnn_buffers.update(marker, data, offset)
+        if closed:
+            cnn_buffers.discard(marker)
+        if not buf:
+            return
+        src, sport, dst, dport = marker
+        result = send_json(cnn_url, {
+            "src": src, "sport": sport, "dst": dst, "dport": dport,
+            "closed": closed,
+            "protocol": [[name, count] for name, count in protocol],
+            # bytes 不能直接塞進 JSON，用 base64 帶過去；tokenize（bytes ->
+            # id 序列）留給推論服務自己做，這裡不重複實作一份 ByteTokenizer
+            "payload_b64": base64.b64encode(buf).decode("ascii"),
         })
-    或直接 lightGBM / textCNN：
-        feats = extract_features(marker, data, protocol)
-        score = model.predict([feats])[0]
-    """
-    src, sport, dst, dport = marker
-    tag = "closed" if closed else "part"
-    proto = "".join(f"{n}x{c}" for n, c in protocol) or "-"
-    print("=" * 80)
-    print(f"[{tag}] {src}:{sport} -> {dst}:{dport}  @{offset}  {proto}  {len(data)}B")
-    print(data[:500])
+        if result is not None:
+            print(f"[cnn]  {src}:{sport} -> {dst}:{dport}  {result}")
+
+    return handle
 
 
-def run(iface=None, bpf="tcp", interval=2.0, idle_timeout=15.0, on_flow=handle_flow):
-    parser   = ProtocolParser()
-    packager = LiveFlowPackager(parser, on_flow=on_flow, idle_timeout=idle_timeout)
+def send_lgbm_features(lgbm_url: str, fwd_marker, features: dict):
+    src, sport, dst, dport = fwd_marker
+    result = send_json(lgbm_url, {"features": features})
+    if result is not None:
+        print(f"[lgbm] {src}:{sport} -> {dst}:{dport}  {result}")
 
-    ticker = RepeatingTimer(interval, packager.consume)
+
+def run(iface=None, bpf="tcp", interval=2.0, idle_timeout=15.0,
+        cnn_url=None, lgbm_url=None):
+    if not cnn_url and not lgbm_url:
+        print("[online] 提醒：--cnn-url 和 --lgbm-url 都沒給，會嗅探封包但不會送去任何地方")
+
+    packager = None
+    if cnn_url:
+        parser = ProtocolParser()
+        packager = LiveFlowPackager(parser, on_flow=make_cnn_handler(cnn_url), idle_timeout=idle_timeout)
+
+    stats_tracker = FlowStatsTracker(idle_timeout=idle_timeout) if lgbm_url else None
+
+    def flush_lgbm():
+        for fwd_marker, features in stats_tracker.consume():
+            try:
+                send_lgbm_features(lgbm_url, fwd_marker, features)
+            except Exception as exc:
+                print(f"[online] lgbm handler error on {fwd_marker}: {exc!r}")
+
+    def sniff_cb(pkt):
+        # CNN 跟 LightGBM 各自維護自己的 flow 狀態，同一個封包分別餵給兩邊，
+        # 互不干擾（其中一邊沒開就跳過）
+        if packager is not None:
+            packager.add(pkt)
+        if stats_tracker is not None:
+            stats_tracker.add(pkt)
+
+    def tick():
+        if packager is not None:
+            packager.consume()
+        if stats_tracker is not None:
+            flush_lgbm()
+
+    ticker = RepeatingTimer(interval, tick)
     ticker.daemon = True
     ticker.start()
 
-    sniffer = AsyncSniffer(iface=iface, filter=bpf, store=False, prn=packager.add)
+    sniffer = AsyncSniffer(iface=iface, filter=bpf, store=False, prn=sniff_cb)
     sniffer.start()
     print(f"[online] sniffing iface={iface or 'default'} filter={bpf!r} "
-          f"(Ctrl+C 結束)")
+          f"(Ctrl+C 結束)  cnn={'on' if cnn_url else 'off'} lgbm={'on' if lgbm_url else 'off'}")
 
     try:
         while sniffer.running:
@@ -158,12 +249,16 @@ def run(iface=None, bpf="tcp", interval=2.0, idle_timeout=15.0, on_flow=handle_f
         except Exception:
             pass
         ticker.cancel()
-        packager.close()       # 把還開著的 flow 全部收尾
-        packager.consume()     # 最後一次把 output 清乾淨
+        if packager is not None:
+            packager.close()       # 把還開著的 flow 全部收尾
+            packager.consume()     # 最後一次把 output 清乾淨
+        if stats_tracker is not None:
+            stats_tracker.close()
+            flush_lgbm()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="即時封包重組（for_pcap 的連線版）")
+    ap = argparse.ArgumentParser(description="即時封包重組")
     ap.add_argument("-i", "--iface", default=None,
                     help="要嗅探的網卡名稱（省略則用 scapy 預設）")
     ap.add_argument("--bpf", default="tcp",
@@ -172,9 +267,14 @@ def main():
                     help="timer 掃描 / 輸出間隔（秒），預設 2")
     ap.add_argument("--idle", type=float, default=15.0,
                     help="flow 閒置多久（秒）視為結束，預設 15")
+    ap.add_argument("--cnn-url", default=None,
+                    help="textCNN 推論服務的網址（例如 http://host:8800/predict），省略則不送")
+    ap.add_argument("--lgbm-url", default=None,
+                    help="LightGBM 推論服務的網址（例如 http://host:8801/predict），省略則不送")
     args = ap.parse_args()
     run(iface=args.iface, bpf=args.bpf,
-        interval=args.interval, idle_timeout=args.idle)
+        interval=args.interval, idle_timeout=args.idle,
+        cnn_url=args.cnn_url, lgbm_url=args.lgbm_url)
 
 
 if __name__ == "__main__":

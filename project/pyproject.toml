@@ -1,0 +1,22 @@
+[project]
+name = "ids2018"
+version = "0.1.0"
+description = "CSE-CIC-IDS2018 pcap / dataset 前處理與封包解析"
+requires-python = ">=3.12"
+dependencies = [
+    "scapy==2.7.0",
+    "torch==2.11.0+cu128",
+    "numpy==2.5.3",
+    "lightgbm==4.7.0",
+    "pandas==3.0.6",
+]
+
+# torch 需以 CUDA 版 index 安裝,PyPI 上僅提供 CPU 版:
+#   pip install torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["req_get", "dataset", "rename_to_pcap"]
