@@ -36,14 +36,13 @@ import re
 from dataclasses import dataclass
 
 import pandas as pd
-from scapy.all import IP, TCP, PcapReader
 
 try:  # 以套件方式執行： python -m pcap_process.for_datasets.pcap_label
-    from .for_pcap import FlowPackager, ProtocolParser
+    from .fast_pcap import iter_host_flows_fast
 except ImportError:  # 直接執行
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from pcap_process.for_datasets.for_pcap import FlowPackager, ProtocolParser
+    from pcap_process.for_datasets.fast_pcap import iter_host_flows_fast
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(DIR))
@@ -108,36 +107,11 @@ class LabeledFlow:
     label: str | None   # None 代表在 CSV 索引裡找不到時間夠接近的對應紀錄
 
 
-def iter_host_flows(pcap_path: str):
-    """重組單一主機 pcap 檔裡的所有 TCP flow，讀完即收尾（每個主機各自一個
-    檔案，彼此不跨檔延續，不需要在檔案之間保留 packager 狀態）。"""
-    parser = ProtocolParser()
-    packager = FlowPackager(parser)
-    with PcapReader(pcap_path) as reader:
-        for pkt in reader:
-            if pkt.haslayer(TCP) and pkt.haslayer(IP):
-                packager.add(pkt)
-    packager.close()
-
-    while packager.output:
-        flow = packager.output.popleft()
-        got = flow.take_contiguous()
-        tail = flow.take_remainder()
-        if got and tail:
-            got = (got[0] + tail[0], got[1])
-        elif tail:
-            got = tail
-        if got is None or flow.start_time is None:
-            continue
-        payload, _offset = got
-        yield flow.marker, flow.start_time, flow.last_time, payload.content, payload.protocol
-
-
 def calibrate_offset(index, calibration_pcap: str, max_samples: int = 200) -> float:
     """csv_epoch - pcap_epoch 的中位差。只用「這個 canonical key 在 CSV 裡
     唯一對應一筆」的 flow 來估，避免同一組五元組當天重複連線造成誤配。"""
     diffs = []
-    for marker, start, _end, _payload, _protocol in iter_host_flows(calibration_pcap):
+    for marker, start, _end, _payload in iter_host_flows_fast(calibration_pcap):
         key = _canonical_key(*marker)
         candidates = index.get(key)
         if candidates and len(candidates) == 1:
@@ -194,10 +168,10 @@ def iter_labeled_flows(
     offset = calibrate_offset(index, calibration_pcap)
 
     for pcap_path in pcap_files:
-        for marker, start, end, payload, protocol in iter_host_flows(pcap_path):
+        for marker, start, end, payload in iter_host_flows_fast(pcap_path):
             label, matched = find_label(index, marker, start, end, offset, tolerance)
             yield LabeledFlow(marker, start, end, payload,
-                               protocol=protocol, label=label if matched else None)
+                               protocol=[], label=label if matched else None)
 
 
 def parse_atk_vic_html(path: str):

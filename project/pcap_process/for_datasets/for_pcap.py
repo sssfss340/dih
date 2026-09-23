@@ -317,7 +317,7 @@ class FlowPackager:
             flow = self.flows[marker] = Flow(marker)
 
         flags = int(tcp.flags)
-        flow.add_segment(tcp.seq, self._payload(pkt, tcp),
+        flow.add_segment(tcp.seq, self._payload(pkt, ip, tcp),
                          syn=bool(flags & 0x02),
                          fin=bool(flags & 0x01),
                          ts=ts)
@@ -341,13 +341,36 @@ class FlowPackager:
 
     # -- internal ----------------------------------------------------------
 
-    def _payload(self, pkt, tcp):
+    def _payload(self, pkt, ip, tcp):
         dns = pkt.getlayer(DNS)
         if dns is not None:
             return self.parser.parse_DNS(dns)
         # 重組的是原始 TCP byte stream，協定只是附加標註
         label = self.parser.identify(None, pkt.getlayer(HTTPRequest), tcp)
-        raw   = bytes(tcp.payload) if tcp.payload else b""
+        # 不能用 bytes(tcp.payload)：實測發現兩個各自獨立的問題（拿真實的
+        # Friday-23-02-2018.csv 逐欄核對出來的）——
+        #   1. 這批資料是從 AWS 的 NIC 擷取的，某些封包（尤其伺服器送出的大
+        #      量資料）scapy 解析出來的 payload 長度比封包自己 IP header 記
+        #      錄的 ip.len 大很多（很可能是 NIC/驅動層 GRO 之類的效果）；
+        #   2. 更嚴重的是內容本身：scapy 辨識出 HTTP response 且是 gzip
+        #      內容時，dissect 出來的 payload 有時是「已解壓縮」的版本，不
+        #      是線路上真正傳輸的 bytes（等於偷偷把資料內容換掉了）。
+        # 兩個問題的共同解法是別用 scapy dissect 後重建的 .payload，改用
+        # pkt.original（scapy 保留、完全沒被 dissect 動過的原始 frame
+        # bytes），自己照 ip.len 算出正確的起訖位置去切。
+        ip_hdr_len = int(ip.ihl) * 4 if ip.ihl else 20
+        tcp_hdr_len = int(tcp.dataofs) * 4 if tcp.dataofs else 20
+        if ip.len and pkt.original:
+            # eth_hdr_len 寫死 14：這批資料全部是標準 Ethernet 沒有 VLAN
+            # tag，用 bytes(pkt)/bytes(ip) 反推長度會重新踩到上面說的 rebuild
+            # 問題（bytes(pkt) 一樣會把 HTTP 那層重新序列化一次），所以不能
+            # 用那個方式算，只能認資料集本身的框架格式。
+            eth_hdr_len = 14
+            start = eth_hdr_len + ip_hdr_len + tcp_hdr_len
+            payload_len = max(0, int(ip.len) - ip_hdr_len - tcp_hdr_len)
+            raw = bytes(pkt.original[start: start + payload_len])
+        else:
+            raw = bytes(tcp.payload) if tcp.payload else b""
         return Payload(label, raw)
 
     def _mark(self, marker):
