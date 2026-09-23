@@ -1,0 +1,10 @@
+{
+  "classes": [
+    "BENIGN",
+    "Web Attack - Brute Force",
+    "Web Attack - SQL",
+    "Web Attack - XSS"
+  ],
+  "max_len": 1500,
+  "embed_dim": 128
+}
